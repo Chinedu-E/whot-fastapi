@@ -269,6 +269,61 @@ async def test_can_win_with_non_action_when_action_wins_disabled(two_player_game
     assert state.status == GameStatus.COMPLETED
     assert state.winner_id == p1_id
     assert state.last_action.startswith("PLAY_CARD:1_cards@")
+    assert state.ended_at is not None
+    p1 = next(p for p in state.players if p.id == p1_id)
+    assert p1.cards_played == 1
+
+
+@pytest.mark.asyncio
+async def test_play_and_pick_counters(two_player_game):
+    game = two_player_game["game"]
+    p1_id = two_player_game["p1_id"]
+    p2_id = two_player_game["p2_id"]
+
+    state = await game._get_game_state()
+    p1 = next(p for p in state.players if p.id == p1_id)
+    p2 = next(p for p in state.players if p.id == p2_id)
+    p1.cards = [
+        Card(shape="circle", number=3),
+        Card(shape="star", number=7),
+    ]
+    state.current_face_card = Card(shape="circle", number=10)
+    state.current_player_id = p1_id
+    state.market.cards = [
+        Card(shape="triangle", number=4),
+        Card(shape="square", number=2),
+    ]
+    await game.set_game_state(state)
+
+    await game.process_game_event(GameEvent(
+        action="PLAY_CARD",
+        payload={"card": {"shape": "circle", "number": 3}},
+        player_id=p1_id,
+        game_id=two_player_game["game_id"],
+    ))
+    state = await game._get_game_state()
+    p1 = next(p for p in state.players if p.id == p1_id)
+    assert p1.cards_played == 1
+    assert p1.cards_drawn == 0
+    assert state.current_player_id == p2_id
+
+    await game.process_game_event(GameEvent(
+        action="PICK_CARD",
+        payload={},
+        player_id=p2_id,
+        game_id=two_player_game["game_id"],
+    ))
+    state = await game._get_game_state()
+    p2 = next(p for p in state.players if p.id == p2_id)
+    assert p2.cards_drawn == 1
+    assert p2.cards_played == 0
+
+    view = await game.get_game_state_for_player(p1_id)
+    assert view is not None
+    v1 = next(p for p in view.players if p.id == p1_id)
+    v2 = next(p for p in view.players if p.id == p2_id)
+    assert v1.cards_played == 1
+    assert v2.cards_drawn == 1
 
 
 @pytest.mark.asyncio

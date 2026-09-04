@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 from datetime import datetime, timedelta
 from typing import Literal, Optional
@@ -11,6 +12,8 @@ from api.models.game import (
     PlayerForSpectator, Spectator, EventType
 )
 from api.services.redis_service import RedisService
+
+logger = logging.getLogger(__name__)
 
 DisconnectAction = Literal["deleted", "finished", "abandon", "clear_abandon", "ok"]
 
@@ -169,7 +172,7 @@ class WhotGame:
         if trigger_cpu:
             latest = await self._get_game_state()
             if latest:
-                await self.check_and_trigger_cpu_if_needed(latest)
+                self.schedule_cpu_check(latest)
 
         return abandon_action
 
@@ -223,6 +226,7 @@ class WhotGame:
     async def _finish_cpu_only_game(self, state: GameState) -> None:
         """Caller must hold the game lock."""
         state.abandon_at = None
+        state.ended_at = datetime.utcnow()
         state.status = GameStatus.COMPLETED
         await self.set_game_state(state)
         await self.broadcast_game_state()
@@ -276,7 +280,7 @@ class WhotGame:
         
         state = await self._get_game_state()
         if state:
-            await self.check_and_trigger_cpu_if_needed(state)
+            self.schedule_cpu_check(state)
         
     async def handle_play_card(self, event: GameEvent, state: GameState) -> None:
         player = next((p for p in state.players if p.id == event.player_id), None)
@@ -328,7 +332,8 @@ class WhotGame:
             self.remove_card_from_player(player, card, card_index)
             state.discard_pile.append(card)
             state.current_face_card = card
-        
+
+        player.cards_played += len(cards_to_play)
         state.last_action = f"PLAY_CARD:{len(cards_to_play)}_cards@{player.name}"
         
         won = len(player.cards) == 0
@@ -336,6 +341,7 @@ class WhotGame:
         if won:
             state.winner_id = player.id
             state.status = GameStatus.COMPLETED
+            state.ended_at = datetime.utcnow()
             await self.broadcast_message(EventType.GAME_ENDED, {
                 "winner_id": str(player.id),
                 "winner_name": player.name
@@ -396,6 +402,7 @@ class WhotGame:
                 player.cards.append(state.market.cards.pop())
                 picked = 1
 
+        player.cards_drawn += picked
         state.last_action = f"PICK_CARD:{picked}_cards@{player.name}"
         
         self.next_turn(state)
@@ -424,9 +431,19 @@ class WhotGame:
         self.remove_card_from_player(player, whot_card)
         state.discard_pile.append(whot_card)
         state.current_face_card = Card(shape=requested_shape, number=20)
+        player.cards_played += 1
         state.last_action = f"USE_WHOT:{requested_shape}@{player.name}"
-        
-        self.next_turn(state)
+
+        if len(player.cards) == 0:
+            state.winner_id = player.id
+            state.status = GameStatus.COMPLETED
+            state.ended_at = datetime.utcnow()
+            await self.broadcast_message(EventType.GAME_ENDED, {
+                "winner_id": str(player.id),
+                "winner_name": player.name
+            })
+        else:
+            self.next_turn(state)
         await self.set_game_state(state)
         await self.broadcast_game_state()
         
@@ -526,6 +543,7 @@ class WhotGame:
                     await self.reset_market(state)
                 if len(state.market.cards) > 0:
                     player.cards.append(state.market.cards.pop())
+                    player.cards_drawn += 1
         # General Market: current player keeps the turn
         
     def next_turn(self, state: GameState) -> None:
@@ -618,8 +636,21 @@ class WhotGame:
         
         state = await self._get_game_state()
         if state:
-            await self.check_and_trigger_cpu_if_needed(state)
+            self.schedule_cpu_check(state)
         
+    def schedule_cpu_check(self, state: GameState) -> None:
+        """Run CPU turns in the background so WS handlers stay responsive."""
+        asyncio.create_task(
+            self._run_cpu_check(state),
+            name=f"cpu-check-{self.game_id}",
+        )
+
+    async def _run_cpu_check(self, state: GameState) -> None:
+        try:
+            await self.check_and_trigger_cpu_if_needed(state)
+        except Exception:
+            logger.exception("CPU check failed for game %s", self.game_id)
+
     async def check_and_trigger_cpu_if_needed(self, state: GameState) -> None:
         if state.status != GameStatus.IN_PROGRESS:
             return
@@ -698,6 +729,8 @@ class WhotGame:
                     is_cpu=p.is_cpu,
                     card_count=len(p.cards),
                     cards=p.cards,
+                    cards_played=p.cards_played,
+                    cards_drawn=p.cards_drawn,
                 ))
             else:
                 players_for_view.append(PlayerForPlayerView(
@@ -707,6 +740,8 @@ class WhotGame:
                     is_cpu=p.is_cpu,
                     card_count=len(p.cards),
                     cards=None,
+                    cards_played=p.cards_played,
+                    cards_drawn=p.cards_drawn,
                 ))
         
         return GameStateForPlayer(
@@ -727,6 +762,7 @@ class WhotGame:
             discard_pile_count=len(state.discard_pile),
             created_at=state.created_at,
             started_at=state.started_at,
+            ended_at=state.ended_at,
             abandon_at=state.abandon_at,
             settings=state.settings
         )
@@ -742,7 +778,9 @@ class WhotGame:
                 name=p.name,
                 is_connected=p.is_connected,
                 card_count=len(p.cards),
-                is_cpu=p.is_cpu
+                is_cpu=p.is_cpu,
+                cards_played=p.cards_played,
+                cards_drawn=p.cards_drawn,
             )
             for p in state.players
         ]
@@ -765,6 +803,7 @@ class WhotGame:
             discard_pile_count=len(state.discard_pile),
             created_at=state.created_at,
             started_at=state.started_at,
+            ended_at=state.ended_at,
             abandon_at=state.abandon_at,
             settings=state.settings
         )

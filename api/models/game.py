@@ -20,6 +20,8 @@ class Player(BaseModel):
     is_connected: bool = True
     cards: list[Card] = []
     is_cpu: bool = False
+    cards_played: int = 0
+    cards_drawn: int = 0
 
 
 class PlayerForSpectator(BaseModel):
@@ -28,6 +30,8 @@ class PlayerForSpectator(BaseModel):
     is_connected: bool = True
     card_count: int
     is_cpu: bool = False
+    cards_played: int = 0
+    cards_drawn: int = 0
 
 
 class Spectator(BaseModel):
@@ -75,6 +79,7 @@ class GameState(BaseModel):
     last_action: Optional[str] = None
     created_at: datetime
     started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
     abandon_at: Optional[datetime] = None
     settings: GameCreate
 
@@ -97,6 +102,7 @@ class GameStateForSpectator(BaseModel):
     discard_pile_count: int
     created_at: datetime
     started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
     abandon_at: Optional[datetime] = None
     settings: GameCreate
 
@@ -109,6 +115,8 @@ class PlayerForPlayerView(BaseModel):
     is_cpu: bool = False
     card_count: int
     cards: Optional[list[Card]] = None
+    cards_played: int = 0
+    cards_drawn: int = 0
 
 
 class GameStateForPlayer(BaseModel):
@@ -129,6 +137,7 @@ class GameStateForPlayer(BaseModel):
     discard_pile_count: int
     created_at: datetime
     started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
     abandon_at: Optional[datetime] = None
     settings: GameCreate
 
