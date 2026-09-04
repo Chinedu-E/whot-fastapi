@@ -1,0 +1,12 @@
+.git
+.cursor
+.venv
+.env
+.pytest_cache
+.python-version
+.DS_Store
+__pycache__
+*.py[oc]
+*.egg-info
+tests
+README.md
