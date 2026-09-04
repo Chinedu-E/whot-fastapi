@@ -1,9 +1,10 @@
+import asyncio
 import random
 from datetime import datetime, timedelta
 from typing import Literal, Optional
 from uuid import UUID, uuid4
 
-from api.core.constants import DECK_DICT, SOLO_ABANDON_SECONDS
+from api.core.constants import CPU_MOVE_DELAY_SECONDS, DECK_DICT, SOLO_ABANDON_SECONDS
 from api.models.game import (
     Card, Deck, GameCreate, GameEvent, GameState, GameStateForPlayer,
     GameStateForSpectator, GameStatus, Player, PlayerForPlayerView,
@@ -299,9 +300,15 @@ class WhotGame:
             return
         
         if not self.is_valid_play_stack(cards_to_play, state.current_face_card, state, player):
-            await self.broadcast_message(EventType.ERROR, {
-                "error": "Invalid card play"
-            }, event.player_id)
+            if state.pick_chain_count > 0:
+                need = "Pick Two (2)" if state.pick_chain_type == 2 else "Pick Three (5)"
+                await self.broadcast_message(EventType.ERROR, {
+                    "error": f"Pick chain active — play a {need} or draw from the market"
+                }, event.player_id)
+            else:
+                await self.broadcast_message(EventType.ERROR, {
+                    "error": "That card doesn’t match the face card"
+                }, event.player_id)
             return
         
         last_card = cards_to_play[-1]
@@ -322,9 +329,18 @@ class WhotGame:
             state.discard_pile.append(card)
             state.current_face_card = card
         
-        state.last_action = f"PLAY_CARD:{len(cards_to_play)}_cards"
+        state.last_action = f"PLAY_CARD:{len(cards_to_play)}_cards@{player.name}"
         
-        if last_card.number == 20:
+        won = len(player.cards) == 0
+
+        if won:
+            state.winner_id = player.id
+            state.status = GameStatus.COMPLETED
+            await self.broadcast_message(EventType.GAME_ENDED, {
+                "winner_id": str(player.id),
+                "winner_name": player.name
+            })
+        elif last_card.number == 20:
             requested_shape = payload.get("requested_shape")
             if requested_shape:
                 await self.handle_whot_card(state, requested_shape)
@@ -342,14 +358,6 @@ class WhotGame:
             await self.handle_general_market(state)
         else:
             self.next_turn(state)
-        
-        if len(player.cards) == 0:
-            state.winner_id = player.id
-            state.status = GameStatus.COMPLETED
-            await self.broadcast_message(EventType.GAME_ENDED, {
-                "winner_id": str(player.id),
-                "winner_name": player.name
-            })
         
         await self.set_game_state(state)
         await self.broadcast_game_state()
@@ -370,6 +378,7 @@ class WhotGame:
         if not player:
             return
         
+        picked = 0
         if state.pick_chain_count > 0:
             cards_to_pick = state.pick_chain_count * (2 if state.pick_chain_type == 2 else 3)
             for _ in range(cards_to_pick):
@@ -377,6 +386,7 @@ class WhotGame:
                     await self.reset_market(state)
                 if len(state.market.cards) > 0:
                     player.cards.append(state.market.cards.pop())
+                    picked += 1
             state.pick_chain_count = 0
             state.pick_chain_type = None
         else:
@@ -384,6 +394,9 @@ class WhotGame:
                 await self.reset_market(state)
             if len(state.market.cards) > 0:
                 player.cards.append(state.market.cards.pop())
+                picked = 1
+
+        state.last_action = f"PICK_CARD:{picked}_cards@{player.name}"
         
         self.next_turn(state)
         await self.set_game_state(state)
@@ -411,7 +424,7 @@ class WhotGame:
         self.remove_card_from_player(player, whot_card)
         state.discard_pile.append(whot_card)
         state.current_face_card = Card(shape=requested_shape, number=20)
-        state.last_action = f"USE_WHOT:{requested_shape}"
+        state.last_action = f"USE_WHOT:{requested_shape}@{player.name}"
         
         self.next_turn(state)
         await self.set_game_state(state)
@@ -646,10 +659,25 @@ class WhotGame:
             return
         
         if current_player.is_cpu:
+            cpu_id = current_player.id
+            await asyncio.sleep(CPU_MOVE_DELAY_SECONDS)
+
+            latest = await self._get_game_state()
+            if (
+                not latest
+                or latest.status != GameStatus.IN_PROGRESS
+                or latest.current_player_id != cpu_id
+            ):
+                return
+
             from api.services.cpu import CPUPlayer
-            cpu_difficulty = state.settings.cpu_difficulty if state.settings.fill_with_computers else "normal"
-            cpu_player = CPUPlayer(current_player.id, self.redis_service, difficulty=cpu_difficulty)
-            await cpu_player.make_move(self.game_id, state)
+            cpu_difficulty = (
+                latest.settings.cpu_difficulty
+                if latest.settings.fill_with_computers
+                else "normal"
+            )
+            cpu_player = CPUPlayer(cpu_id, self.redis_service, difficulty=cpu_difficulty)
+            await cpu_player.make_move(self.game_id, latest)
     
     async def broadcast_game_state(self) -> None:
         """Publish a lightweight signal; each WS connection builds a filtered view."""

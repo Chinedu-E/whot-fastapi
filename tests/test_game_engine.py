@@ -245,6 +245,33 @@ async def test_use_whot_removes_single(two_player_game):
 
 
 @pytest.mark.asyncio
+async def test_can_win_with_non_action_when_action_wins_disabled(two_player_game):
+    game = two_player_game["game"]
+    p1_id = two_player_game["p1_id"]
+    redis = two_player_game["redis"]
+
+    state = await game._get_game_state()
+    assert state.settings.can_win_with_action is False
+    p1 = next(p for p in state.players if p.id == p1_id)
+    p1.cards = [Card(shape="circle", number=7)]
+    state.current_face_card = Card(shape="circle", number=3)
+    state.current_player_id = p1_id
+    await game.set_game_state(state)
+    await redis.add_active_game(two_player_game["game_id"])
+
+    await game.process_game_event(GameEvent(
+        action="PLAY_CARD",
+        payload={"card": {"shape": "circle", "number": 7}},
+        player_id=p1_id,
+        game_id=two_player_game["game_id"],
+    ))
+    state = await game._get_game_state()
+    assert state.status == GameStatus.COMPLETED
+    assert state.winner_id == p1_id
+    assert state.last_action.startswith("PLAY_CARD:1_cards@")
+
+
+@pytest.mark.asyncio
 async def test_cannot_win_with_action(two_player_game):
     game = two_player_game["game"]
     p1_id = two_player_game["p1_id"]
