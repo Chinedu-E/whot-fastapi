@@ -8,3 +8,6 @@ DECK_DICT = {
 
 # Seconds to wait when only one connected human remains before ending the table.
 SOLO_ABANDON_SECONDS = 60
+
+# Pause before each CPU move so play reads on screen.
+CPU_MOVE_DELAY_SECONDS = 3
