@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from uuid import UUID
 
@@ -8,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import ConnectionPool
 
 from api.core.config import settings
+from api.core.constants import WS_PING_INTERVAL_SECONDS
 from api.middleware.dependencies import get_games_manager, get_games_manager_ws, get_player_id
 from api.models.game import GameCreate, GameResponse, GameStatus, GameListItem, EventType
 from api.services.session import GamesManager
@@ -63,6 +65,14 @@ async def _send_player_game_state(websocket: WebSocket, game: WhotGame, game_id:
             "game_id": str(game_id),
             "player_id": str(player_id),
         })
+
+
+async def _maybe_send_ping(websocket: WebSocket, last_ping_at: float) -> float:
+    now = time.monotonic()
+    if now - last_ping_at < WS_PING_INTERVAL_SECONDS:
+        return last_ping_at
+    await websocket.send_json({"event_type": EventType.PING.value})
+    return now
 
 
 @app.websocket("/join/{game_id}")
@@ -122,11 +132,19 @@ async def join_game(
     game = WhotGame(game_id, redis_service)
     await _send_player_game_state(websocket, game, game_id, player_id)
 
+    intentional_leave = False
+    last_ping_at = time.monotonic()
+
     try:
         while True:
             try:
                 user_message = await asyncio.wait_for(websocket.receive_json(), timeout=0.1)
-                await game_manager.handle_user_message(user_message, game_id, player_id)
+                still_connected = await game_manager.handle_user_message(
+                    user_message, game_id, player_id
+                )
+                if not still_connected:
+                    intentional_leave = True
+                    break
             except asyncio.TimeoutError:
                 pass
             except WebSocketDisconnect:
@@ -141,13 +159,19 @@ async def join_game(
                     await websocket.send_json(data)
                 if data.get('event_type') == EventType.GAME_ENDED.value:
                     break
+
+            last_ping_at = await _maybe_send_ping(websocket, last_ping_at)
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         pass
     finally:
         await pubsub.aclose()
 
-    await game_manager.remove_from_game(game_id, player_id)
+    if intentional_leave:
+        # LEAVE already called remove_from_game
+        return
+
+    await game_manager.handle_socket_disconnect(game_id, player_id)
 
 
 @app.websocket("/spectate/{game_id}")
@@ -202,6 +226,8 @@ async def spectate_game(
             "game_id": str(game_id)
         })
 
+    last_ping_at = time.monotonic()
+
     try:
         while True:
             game_message = await pubsub.get_message(ignore_subscribe_messages=True)
@@ -219,6 +245,7 @@ async def spectate_game(
                     await websocket.send_json(data)
                 if data.get('event_type') == EventType.GAME_ENDED.value:
                     break
+            last_ping_at = await _maybe_send_ping(websocket, last_ping_at)
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         pass
