@@ -4,12 +4,14 @@ from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 
+from api.core.constants import DISCONNECT_GRACE_SECONDS
 from api.models.game import GameCreate, GameResponse, GameStatus, GameListItem, GameEvent, EventType
 from api.services.game import DisconnectAction, WhotGame
 from api.services.redis_service import RedisService
 
 # Process-wide so timers survive per-request GamesManager instances.
 _abandon_tasks: dict[UUID, asyncio.Task] = {}
+_disconnect_tasks: dict[tuple[UUID, UUID], asyncio.Task] = {}
 
 
 class GamesManager:
@@ -26,6 +28,7 @@ class GamesManager:
         
     async def delete_game(self, game_id: UUID) -> None:
         self.cancel_abandon(game_id)
+        self.cancel_all_disconnects(game_id)
         await self.redis_service.delete_game(game_id)
 
     def cancel_abandon(self, game_id: UUID) -> None:
@@ -53,6 +56,46 @@ class GamesManager:
             if existing is asyncio.current_task():
                 _abandon_tasks.pop(game_id, None)
 
+    def cancel_disconnect(self, game_id: UUID, player_id: UUID) -> None:
+        key = (game_id, player_id)
+        task = _disconnect_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+
+    def cancel_all_disconnects(self, game_id: UUID) -> None:
+        for key in list(_disconnect_tasks.keys()):
+            if key[0] == game_id:
+                self.cancel_disconnect(key[0], key[1])
+
+    def schedule_disconnect(self, game_id: UUID, player_id: UUID) -> None:
+        """After an unexpected mid-game drop, delay remove_player so the client can reconnect."""
+        self.cancel_disconnect(game_id, player_id)
+        key = (game_id, player_id)
+        _disconnect_tasks[key] = asyncio.create_task(
+            self._run_disconnect(game_id, player_id, DISCONNECT_GRACE_SECONDS),
+            name=f"disconnect-{game_id}-{player_id}",
+        )
+
+    async def _run_disconnect(self, game_id: UUID, player_id: UUID, delay: float) -> None:
+        key = (game_id, player_id)
+        try:
+            await asyncio.sleep(delay)
+            await self.remove_from_game(game_id, player_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            existing = _disconnect_tasks.get(key)
+            if existing is asyncio.current_task():
+                _disconnect_tasks.pop(key, None)
+
+    async def handle_socket_disconnect(self, game_id: UUID, player_id: UUID) -> None:
+        """Waiting-room drops are immediate; in-progress gets a reconnect grace window."""
+        status = await self.get_game_status(game_id)
+        if status == GameStatus.IN_PROGRESS:
+            self.schedule_disconnect(game_id, player_id)
+            return
+        await self.remove_from_game(game_id, player_id)
+
     async def _apply_abandon_action(
         self,
         game_id: UUID,
@@ -76,6 +119,9 @@ class GamesManager:
         return False
         
     async def add_to_game(self, game_id: UUID, player_id: UUID, player_name: str, is_reconnecting: bool) -> bool:
+        # Cancel any pending grace timer before (re)joining.
+        self.cancel_disconnect(game_id, player_id)
+
         game = WhotGame(game_id, self.redis_service)
         state = await game._get_game_state()
         if not state:
@@ -101,6 +147,7 @@ class GamesManager:
         return success
     
     async def remove_from_game(self, game_id: UUID, player_id: UUID) -> None:
+        self.cancel_disconnect(game_id, player_id)
         game = WhotGame(game_id, self.redis_service)
         action = await game.remove_player(player_id)
         latest = await self.redis_service.get_game_state(game_id)
@@ -110,15 +157,24 @@ class GamesManager:
             latest.abandon_at if latest else None,
         )
         
-    async def handle_user_message(self, message: dict, game_id: UUID, player_id: UUID) -> None:
+    async def handle_user_message(self, message: dict, game_id: UUID, player_id: UUID) -> bool:
+        """Process a client WS message. Returns False if the client intentionally left."""
+        # Keepalive — ignore without treating as a game action.
+        if message.get("event_type") == EventType.PING.value or message.get("action") == "PING":
+            return True
+
         try:
             event = GameEvent.model_validate(message)
             if event.game_id != game_id:
-                return
-            
+                return True
+
             # Always bind identity to the WebSocket connection — ignore client-supplied player_id
             event.player_id = player_id
-            
+
+            if event.action == "LEAVE":
+                await self.remove_from_game(game_id, player_id)
+                return False
+
             game = WhotGame(game_id, self.redis_service)
             await game.process_game_event(event)
         except Exception as e:
@@ -128,6 +184,7 @@ class GamesManager:
                 {"error": str(e), "message": "Invalid message format"},
                 player_id
             )
+        return True
         
     async def get_game_status(self, game_id: UUID) -> GameStatus | None:
         state = await self.redis_service.get_game_state(game_id)
