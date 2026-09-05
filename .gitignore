@@ -10,4 +10,7 @@ wheels/
 .venv
 .env
 
+# RL checkpoints (large weight files)
+rl/checkpoints/**/*.zip
+
 .cursor
