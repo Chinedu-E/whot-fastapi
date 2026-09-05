@@ -162,6 +162,8 @@ class EventType(str, Enum):
     PLAYER_JOINED = "PLAYER_JOINED"
     PLAYER_LEFT = "PLAYER_LEFT"
     TURN_CHANGED = "TURN_CHANGED"
+    PING = "PING"
+    LEAVE = "LEAVE"
 
 
 class GamePayload(BaseModel):
@@ -188,7 +190,7 @@ class UseWhotEvent(BaseModel):
 
 
 class GameEvent(BaseModel):
-    action: Literal["PLAY_CARD", "PICK_CARD", "USE_WHOT"]
+    action: Literal["PLAY_CARD", "PICK_CARD", "USE_WHOT", "LEAVE"]
     payload: dict
     player_id: UUID
     game_id: UUID

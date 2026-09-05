@@ -1,17 +1,17 @@
 import asyncio
 import logging
-import random
 from datetime import datetime, timedelta
 from typing import Literal, Optional
 from uuid import UUID, uuid4
 
-from api.core.constants import CPU_MOVE_DELAY_SECONDS, DECK_DICT, SOLO_ABANDON_SECONDS
+from api.core.constants import CPU_MOVE_DELAY_SECONDS, SOLO_ABANDON_SECONDS
 from api.models.game import (
     Card, Deck, GameCreate, GameEvent, GameState, GameStateForPlayer,
     GameStateForSpectator, GameStatus, Player, PlayerForPlayerView,
     PlayerForSpectator, Spectator, EventType
 )
 from api.services.redis_service import RedisService
+from rl import engine as whot_engine
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +48,8 @@ class WhotGame:
         return await self.redis_service.get_game_state(self.game_id)
         
     def create_deck(self) -> tuple[list[Card], Card]:
-        cards = []
-        for shape, numbers in DECK_DICT.items():
-            for number in numbers:
-                cards.append(Card(shape=shape, number=number))
-        
-        for _ in range(5):
-            cards.append(Card(shape="whot", number=20))
-        
-        random.shuffle(cards)
-        init_card = cards.pop()
-        return cards, init_card
-        
+        return whot_engine.create_deck()
+ 
     async def add_player(self, player: Player, is_reconnecting: bool = False) -> tuple[bool, DisconnectAction]:
         abandon_action: DisconnectAction = "ok"
         async with self.redis_service.game_lock(self.game_id):
@@ -190,7 +180,7 @@ class WhotGame:
 
     @staticmethod
     def _is_eligible_turn(player: Player) -> bool:
-        return player.is_cpu or player.is_connected
+        return whot_engine.is_eligible_turn(player)
 
     def _sync_abandon_window(self, state: GameState) -> DisconnectAction:
         """Update abandon_at for solo-human reconnect window. Mutates state."""
@@ -283,16 +273,11 @@ class WhotGame:
             self.schedule_cpu_check(state)
         
     async def handle_play_card(self, event: GameEvent, state: GameState) -> None:
-        player = next((p for p in state.players if p.id == event.player_id), None)
-        if not player:
-            return
-        
         payload = event.payload
-        cards_to_play = []
-        
+        cards_to_play: list[Card] = []
+
         if "cards" in payload and payload["cards"]:
-            cards_data = payload["cards"]
-            for card_data in cards_data:
+            for card_data in payload["cards"]:
                 cards_to_play.append(Card(shape=card_data["shape"], number=card_data["number"]))
         elif "card" in payload and payload["card"]:
             card_data = payload["card"]
@@ -302,286 +287,113 @@ class WhotGame:
                 "error": "No card specified"
             }, event.player_id)
             return
-        
-        if not self.is_valid_play_stack(cards_to_play, state.current_face_card, state, player):
-            if state.pick_chain_count > 0:
-                need = "Pick Two (2)" if state.pick_chain_type == 2 else "Pick Three (5)"
-                await self.broadcast_message(EventType.ERROR, {
-                    "error": f"Pick chain active — play a {need} or draw from the market"
-                }, event.player_id)
-            else:
-                await self.broadcast_message(EventType.ERROR, {
-                    "error": "That card doesn’t match the face card"
-                }, event.player_id)
+
+        result = whot_engine.apply_play(
+            state,
+            event.player_id,
+            cards_to_play,
+            requested_shape=payload.get("requested_shape"),
+            card_indices=payload.get("card_indices") or None,
+            card_index=payload.get("card_index"),
+            require_eligible=True,
+        )
+        if not result.success:
+            await self.broadcast_message(EventType.ERROR, {
+                "error": result.error or "Invalid play"
+            }, event.player_id)
             return
-        
-        last_card = cards_to_play[-1]
-        will_win = len(player.cards) == len(cards_to_play)
-        
-        if not state.settings.can_win_with_action and will_win:
-            is_action_card = last_card.number in [1, 2, 5, 8, 14, 20]
-            if is_action_card:
-                await self.broadcast_message(EventType.ERROR, {
-                    "error": "Cannot win with action card"
-                }, event.player_id)
-                return
-        
-        card_indices = payload.get("card_indices", [])
-        for idx, card in enumerate(cards_to_play):
-            card_index = card_indices[idx] if idx < len(card_indices) else payload.get("card_index") if idx == 0 else None
-            self.remove_card_from_player(player, card, card_index)
-            state.discard_pile.append(card)
-            state.current_face_card = card
 
-        player.cards_played += len(cards_to_play)
-        state.last_action = f"PLAY_CARD:{len(cards_to_play)}_cards@{player.name}"
-        
-        won = len(player.cards) == 0
-
-        if won:
-            state.winner_id = player.id
-            state.status = GameStatus.COMPLETED
-            state.ended_at = datetime.utcnow()
+        if result.game_ended:
             await self.broadcast_message(EventType.GAME_ENDED, {
-                "winner_id": str(player.id),
-                "winner_name": player.name
+                "winner_id": str(result.winner_id) if result.winner_id else None,
+                "winner_name": result.winner_name,
             })
-        elif last_card.number == 20:
-            requested_shape = payload.get("requested_shape")
-            if requested_shape:
-                await self.handle_whot_card(state, requested_shape)
-            else:
-                self.next_turn(state)
-        elif last_card.number == 2:
-            await self.handle_pick_2(state)
-        elif last_card.number == 5:
-            await self.handle_pick_5(state)
-        elif last_card.number == 1:
-            await self.handle_hold_on(state)
-        elif last_card.number == 8:
-            await self.handle_suspension(state)
-        elif last_card.number == 14:
-            await self.handle_general_market(state)
-        else:
-            self.next_turn(state)
-        
+
         await self.set_game_state(state)
         await self.broadcast_game_state()
-    
+
     def remove_card_from_player(self, player: Player, card: Card, card_index: Optional[int] = None) -> None:
-        if card_index is not None and 0 <= card_index < len(player.cards):
-            if player.cards[card_index].shape == card.shape and player.cards[card_index].number == card.number:
-                player.cards.pop(card_index)
-                return
-        
-        for i, c in enumerate(player.cards):
-            if c.shape == card.shape and c.number == card.number:
-                player.cards.pop(i)
-                return
-        
+        whot_engine.remove_card_from_player(player, card, card_index)
+
     async def handle_pick_card(self, event: GameEvent, state: GameState) -> None:
-        player = next((p for p in state.players if p.id == event.player_id), None)
-        if not player:
+        result = whot_engine.apply_pick(
+            state,
+            event.player_id,
+            require_eligible=True,
+        )
+        if not result.success:
+            await self.broadcast_message(EventType.ERROR, {
+                "error": result.error or "Invalid pick"
+            }, event.player_id)
             return
-        
-        picked = 0
-        if state.pick_chain_count > 0:
-            cards_to_pick = state.pick_chain_count * (2 if state.pick_chain_type == 2 else 3)
-            for _ in range(cards_to_pick):
-                if len(state.market.cards) == 0:
-                    await self.reset_market(state)
-                if len(state.market.cards) > 0:
-                    player.cards.append(state.market.cards.pop())
-                    picked += 1
-            state.pick_chain_count = 0
-            state.pick_chain_type = None
-        else:
-            if len(state.market.cards) == 0:
-                await self.reset_market(state)
-            if len(state.market.cards) > 0:
-                player.cards.append(state.market.cards.pop())
-                picked = 1
 
-        player.cards_drawn += picked
-        state.last_action = f"PICK_CARD:{picked}_cards@{player.name}"
-        
-        self.next_turn(state)
         await self.set_game_state(state)
         await self.broadcast_game_state()
-        
+
     async def handle_use_whot(self, event: GameEvent, state: GameState) -> None:
-        requested_shape = event.payload.get("requested_shape")
-        if not requested_shape:
+        result = whot_engine.apply_use_whot(
+            state,
+            event.player_id,
+            event.payload.get("requested_shape") or "",
+            require_eligible=True,
+        )
+        if not result.success:
             await self.broadcast_message(EventType.ERROR, {
-                "error": "Must specify requested shape"
+                "error": result.error or "Invalid whot"
             }, event.player_id)
             return
-        
-        player = next((p for p in state.players if p.id == event.player_id), None)
-        if not player:
-            return
-        
-        whot_card = next((c for c in player.cards if c.number == 20), None)
-        if not whot_card:
-            await self.broadcast_message(EventType.ERROR, {
-                "error": "No whot card in hand"
-            }, event.player_id)
-            return
-        
-        self.remove_card_from_player(player, whot_card)
-        state.discard_pile.append(whot_card)
-        state.current_face_card = Card(shape=requested_shape, number=20)
-        player.cards_played += 1
-        state.last_action = f"USE_WHOT:{requested_shape}@{player.name}"
 
-        if len(player.cards) == 0:
-            state.winner_id = player.id
-            state.status = GameStatus.COMPLETED
-            state.ended_at = datetime.utcnow()
+        if result.game_ended:
             await self.broadcast_message(EventType.GAME_ENDED, {
-                "winner_id": str(player.id),
-                "winner_name": player.name
+                "winner_id": str(result.winner_id) if result.winner_id else None,
+                "winner_name": result.winner_name,
             })
-        else:
-            self.next_turn(state)
+
         await self.set_game_state(state)
         await self.broadcast_game_state()
-        
+
     def is_valid_play_stack(self, cards: list[Card], face_card: Card, state: GameState, player: Player) -> bool:
-        if not cards:
-            return False
-        
-        if state.pick_chain_count > 0:
-            if state.pick_chain_type == 2:
-                return all(c.number == 2 for c in cards)
-            elif state.pick_chain_type == 5:
-                return all(c.number == 5 for c in cards)
-            return False
-        
-        first_card = cards[0]
-        
-        if not self.is_valid_first_card(first_card, face_card, state):
-            return False
-        
-        if len(cards) > 1:
-            first_number = first_card.number
-            for card in cards[1:]:
-                if card.number != first_number:
-                    return False
-        
-        player_card_counts = {}
-        for c in player.cards:
-            key = (c.shape, c.number)
-            player_card_counts[key] = player_card_counts.get(key, 0) + 1
-        
-        for card in cards:
-            key = (card.shape, card.number)
-            if player_card_counts.get(key, 0) == 0:
-                return False
-            player_card_counts[key] -= 1
-        
-        return True
-    
+        return whot_engine.is_valid_play_stack(cards, face_card, state, player)
+
     def is_valid_first_card(self, card: Card, face_card: Card, state: GameState) -> bool:
-        if card.number == 20:
-            return True
-        
-        if face_card.number == 20:
-            return card.shape == state.current_face_card.shape
-        
-        return card.shape == face_card.shape or card.number == face_card.number
-    
+        return whot_engine.is_valid_first_card(card, face_card, state)
+
     def is_valid_play(self, card: Card, face_card: Card, state: GameState) -> bool:
-        if state.pick_chain_count > 0:
-            if state.pick_chain_type == 2:
-                return card.number == 2
-            elif state.pick_chain_type == 5:
-                return card.number == 5
-            return False
-        
-        if card.number == 20:
-            return True
-        
-        if face_card.number == 20:
-            return card.shape == state.current_face_card.shape
-        
-        return card.shape == face_card.shape or card.number == face_card.number
-        
+        return whot_engine.is_valid_play(card, face_card, state)
+
     async def handle_whot_card(self, state: GameState, requested_shape: str) -> None:
-        state.current_face_card = Card(shape=requested_shape, number=20)
-        self.next_turn(state)
-        
+        whot_engine._apply_whot_shape(state, requested_shape, require_eligible=True)
+
     async def handle_pick_2(self, state: GameState) -> None:
-        if state.pick_chain_type == 2:
-            state.pick_chain_count += 1
-        else:
-            state.pick_chain_count = 1
-            state.pick_chain_type = 2
-        self.next_turn(state)
-        
+        whot_engine._apply_pick_2(state, require_eligible=True)
+
     async def handle_pick_5(self, state: GameState) -> None:
-        if state.pick_chain_type == 5:
-            state.pick_chain_count += 1
-        else:
-            state.pick_chain_count = 1
-            state.pick_chain_type = 5
-        self.next_turn(state)
-        
+        whot_engine._apply_pick_5(state, require_eligible=True)
+
     async def handle_hold_on(self, state: GameState) -> None:
-        # Hold On: current player plays again (no turn advance)
         return
-    
+
     async def handle_suspension(self, state: GameState) -> None:
-        # Suspension: skip the next player
-        self.next_turn(state)
-        self.next_turn(state)
-        
+        whot_engine._apply_suspension(state, require_eligible=True)
+
     async def handle_general_market(self, state: GameState) -> None:
-        for player in state.players:
-            if player.id != state.current_player_id:
-                if len(state.market.cards) == 0:
-                    await self.reset_market(state)
-                if len(state.market.cards) > 0:
-                    player.cards.append(state.market.cards.pop())
-                    player.cards_drawn += 1
-        # General Market: current player keeps the turn
-        
+        whot_engine._apply_general_market(state)
+
     def next_turn(self, state: GameState) -> None:
-        if not state.players:
-            return
-        n = len(state.players)
-        current_idx = self.get_current_player_index(state)
-        next_idx = (current_idx + state.direction) % n
-        state.current_player_id = state.players[next_idx].id
-        for _ in range(n - 1):
-            player = state.players[self.get_current_player_index(state)]
-            if self._is_eligible_turn(player):
-                return
-            next_idx = (self.get_current_player_index(state) + state.direction) % n
-            state.current_player_id = state.players[next_idx].id
-        
+        whot_engine.next_turn(state, require_eligible=True)
+
     def get_current_player_index(self, state: GameState) -> int:
-        for i, player in enumerate(state.players):
-            if player.id == state.current_player_id:
-                return i
-        return 0
-        
+        return whot_engine.get_current_player_index(state)
+
     def get_next_player_index(self, state: GameState) -> int:
-        current_idx = self.get_current_player_index(state)
-        return (current_idx + state.direction) % len(state.players)
-        
+        return whot_engine.get_next_player_index(state)
+
     def can_defend_pick_chain(self, player: Player, state: GameState) -> bool:
-        return any(c.number == state.pick_chain_type for c in player.cards)
-        
+        return whot_engine.can_defend_pick_chain(player, state)
+
     async def reset_market(self, state: GameState) -> None:
-        if len(state.discard_pile) <= 1:
-            return
-        current_face = state.discard_pile[-1]
-        market_cards = state.discard_pile[:-1]
-        random.shuffle(market_cards)
-        state.market.cards = market_cards
-        state.discard_pile = [current_face]
-        
+        whot_engine.reset_market(state)
+ 
     async def start_game(self) -> None:
         async with self.redis_service.game_lock(self.game_id):
             state = await self._get_game_state()
