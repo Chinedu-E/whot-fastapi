@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from uuid import uuid4
 
@@ -17,6 +18,8 @@ async def test_deck_composition():
     expected = sum(len(nums) for nums in DECK_DICT.values()) + 5
     assert len(all_cards) == expected
     assert sum(1 for c in all_cards if c.number == 20) == 5
+    assert face.number != 20
+    assert face.shape != "whot"
 
 
 @pytest.mark.asyncio
@@ -657,3 +660,132 @@ async def test_cpu_does_not_move_after_humans_leave(two_player_game):
     assert state.current_face_card.shape == "circle"
     assert state.current_face_card.number == 3
     assert any(c.shape == "square" and c.number == 3 for c in p2.cards)
+
+
+def _manager(redis) -> GamesManager:
+    manager = GamesManager.__new__(GamesManager)
+    manager.redis_client = None
+    manager.redis_service = redis
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_in_progress_socket_disconnect_schedules_grace(two_player_game, monkeypatch):
+    import api.services.session as session_mod
+
+    redis = two_player_game["redis"]
+    game_id = two_player_game["game_id"]
+    p1_id = two_player_game["p1_id"]
+    manager = _manager(redis)
+
+    monkeypatch.setattr(session_mod, "DISCONNECT_GRACE_SECONDS", 0.05)
+    # Clear any leftover tasks from prior tests
+    session_mod._disconnect_tasks.clear()
+
+    await manager.handle_socket_disconnect(game_id, p1_id)
+
+    state = await redis.get_game_state(game_id)
+    p1 = next(p for p in state.players if p.id == p1_id)
+    assert p1.is_connected is True
+    assert (game_id, p1_id) in session_mod._disconnect_tasks
+
+    await asyncio.sleep(0.15)
+    state = await redis.get_game_state(game_id)
+    p1 = next(p for p in state.players if p.id == p1_id)
+    assert p1.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cancels_disconnect_grace(two_player_game, monkeypatch):
+    import api.services.session as session_mod
+
+    redis = two_player_game["redis"]
+    game_id = two_player_game["game_id"]
+    p1_id = two_player_game["p1_id"]
+    manager = _manager(redis)
+
+    monkeypatch.setattr(session_mod, "DISCONNECT_GRACE_SECONDS", 2.0)
+    session_mod._disconnect_tasks.clear()
+
+    await manager.handle_socket_disconnect(game_id, p1_id)
+    assert (game_id, p1_id) in session_mod._disconnect_tasks
+
+    ok = await manager.add_to_game(game_id, p1_id, "Alice", is_reconnecting=True)
+    assert ok
+    assert (game_id, p1_id) not in session_mod._disconnect_tasks
+
+    await asyncio.sleep(0.05)
+    state = await redis.get_game_state(game_id)
+    p1 = next(p for p in state.players if p.id == p1_id)
+    assert p1.is_connected is True
+
+
+@pytest.mark.asyncio
+async def test_leave_removes_player_immediately(two_player_game):
+    redis = two_player_game["redis"]
+    game_id = two_player_game["game_id"]
+    p1_id = two_player_game["p1_id"]
+    manager = _manager(redis)
+
+    message = {
+        "action": "LEAVE",
+        "payload": {},
+        "player_id": str(p1_id),
+        "game_id": str(game_id),
+    }
+    still = await manager.handle_user_message(message, game_id, p1_id)
+    assert still is False
+
+    state = await redis.get_game_state(game_id)
+    p1 = next(p for p in state.players if p.id == p1_id)
+    assert p1.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_waiting_room_socket_disconnect_is_immediate(redis_service, game_settings):
+    from datetime import datetime
+    from api.models.game import Deck, GameState, GameStatus, Player
+
+    game_id = uuid4()
+    p1_id = uuid4()
+    p2_id = uuid4()
+    game = WhotGame(game_id, redis_service)
+    state = GameState(
+        game_id=game_id,
+        deck=Deck(cards=[]),
+        market=Deck(cards=[]),
+        discard_pile=[Card(shape="circle", number=3)],
+        players=[Player(id=p1_id, name="Alice"), Player(id=p2_id, name="Bob")],
+        spectators=[],
+        num_spectators=0,
+        status=GameStatus.WAITING_FOR_PLAYERS,
+        current_face_card=Card(shape="circle", number=3),
+        time_elapsed=0,
+        created_at=datetime.utcnow(),
+        settings=game_settings,
+    )
+    await redis_service.set_game_state(game_id, state)
+    await redis_service.add_active_game(game_id)
+    await redis_service.add_player_to_game(game_id, p1_id)
+    await redis_service.add_player_to_game(game_id, p2_id)
+
+    manager = _manager(redis_service)
+    await manager.handle_socket_disconnect(game_id, p1_id)
+
+    state = await redis_service.get_game_state(game_id)
+    assert [p.id for p in state.players] == [p2_id]
+
+
+@pytest.mark.asyncio
+async def test_ping_message_is_ignored(two_player_game):
+    redis = two_player_game["redis"]
+    game_id = two_player_game["game_id"]
+    p1_id = two_player_game["p1_id"]
+    manager = _manager(redis)
+
+    still = await manager.handle_user_message(
+        {"event_type": "PING"}, game_id, p1_id
+    )
+    assert still is True
+    state = await redis.get_game_state(game_id)
+    assert state.current_player_id == p1_id
