@@ -9,5 +9,12 @@ DECK_DICT = {
 # Seconds to wait when only one connected human remains before ending the table.
 SOLO_ABANDON_SECONDS = 60
 
+# In-progress: keep the seat live this long after an unexpected WS drop
+# so the client can reconnect before turns are skipped / abandon starts.
+DISCONNECT_GRACE_SECONDS = 20
+
+# Server → client keepalive interval (seconds) so idle proxies do not drop quiet tables.
+WS_PING_INTERVAL_SECONDS = 20
+
 # Pause before each CPU move so play reads on screen.
 CPU_MOVE_DELAY_SECONDS = 3
