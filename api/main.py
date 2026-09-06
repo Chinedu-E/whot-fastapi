@@ -2,10 +2,12 @@ import json
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from redis.asyncio import ConnectionPool
 
 from api.core.config import settings
@@ -15,6 +17,8 @@ from api.models.game import GameCreate, GameResponse, GameStatus, GameListItem, 
 from api.services.session import GamesManager
 from api.services.game import WhotGame
 from api.services.redis_service import RedisService
+
+LEGAL_DIR = Path(__file__).resolve().parent / "static" / "legal"
 
 
 @asynccontextmanager
@@ -39,6 +43,18 @@ app.add_middleware(
 async def health():
     """Lightweight liveness probe for clients and load balancers."""
     return {"ok": True}
+
+
+@app.get("/privacy")
+async def privacy_policy():
+    """Hosted privacy policy for App Store Connect and in-app links."""
+    return FileResponse(LEGAL_DIR / "privacy.html", media_type="text/html; charset=utf-8")
+
+
+@app.get("/support")
+async def support_page():
+    """Hosted support page for App Store Connect and in-app links."""
+    return FileResponse(LEGAL_DIR / "support.html", media_type="text/html; charset=utf-8")
 
 
 @app.post("/games", response_model=GameResponse)
