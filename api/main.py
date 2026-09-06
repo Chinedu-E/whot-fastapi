@@ -35,6 +35,12 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+async def health():
+    """Lightweight liveness probe for clients and load balancers."""
+    return {"ok": True}
+
+
 @app.post("/games", response_model=GameResponse)
 async def create_game(
     game_settings: GameCreate,
